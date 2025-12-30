@@ -1,0 +1,5 @@
+# Control file for pg_trace
+default_version = '1.0'
+comment = 'A PostgreSQL extension for query performance tracing and analysis.'
+module_pathname = '$libdir/pg_trace'
+relocatable = true

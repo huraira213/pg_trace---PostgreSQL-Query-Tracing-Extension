@@ -1,0 +1,21 @@
+# Build artifacts
+*.o
+*.so
+*.a
+*.pc
+
+# PostgreSQL build files
+*.bc
+bitcode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+*.swp
+*.swo
+
+# Temporary files
+*~
