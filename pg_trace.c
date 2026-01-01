@@ -1,45 +1,93 @@
 #include "postgres.h"
 #include "fmgr.h"
-#include "utils/builtins.h"
-#include <string.h>
+#include "utils/timestamp.h"
+#include "utils/builtins.h"  // Needed for type handling
 
 PG_MODULE_MAGIC;
 
-/* ---------- Module Variables ---------- */
-static bool tracing_enabled = false;  
+// Session state
+static TimestampTz trace_start_time = 0;
+static bool tracing_active = false;  // Better than checking start_time != 0
 
-PG_FUNCTION_INFO_V1(pg_trace_version);
-PG_FUNCTION_INFO_V1(pg_trace_enable);
-PG_FUNCTION_INFO_V1(pg_trace_disable);
-PG_FUNCTION_INFO_V1(pg_trace_status);
-
-
-// Function for Version information
-Datum pg_trace_version(PG_FUNCTION_ARGS)
+// Helper to ensure tracing is active
+static void
+ensure_tracing_active(void)
 {
-    const char *version = "pg_trace version 1.0.0 - Stage 1 : Foundation\n";
-    text *result = cstring_to_text(version);
-    PG_RETURN_TEXT_P(result);
+    if (!tracing_active)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("tracing not active"),
+                 errhint("Call pg_trace_start() first")));
 }
 
-// Enable/Disable Functions
-Datum pg_trace_enable(PG_FUNCTION_ARGS)
+// Start tracing
+PG_FUNCTION_INFO_V1(pg_trace_start);
+Datum
+pg_trace_start(PG_FUNCTION_ARGS)
 {
-    tracing_enabled = true;
+    // Check if already tracing
+    if (tracing_active)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("tracing already active"),
+                 errhint("Call pg_trace_stop() first")));
     
-    ereport(INFO, (errmsg("pg_trace: tracing enabled.")));
-
+    tracing_active = true;
+    trace_start_time = GetCurrentTimestamp();
+    
+    ereport(NOTICE,
+            (errmsg("Trace started at: %lld microseconds since 2000-01-01"),
+             (long long)trace_start_time));
+    
+    // Return success (void functions are tricky in PG extensions)
     PG_RETURN_BOOL(true);
 }
 
-Datum pg_trace_disable(PG_FUNCTION_ARGS)
+// Stop tracing and return interval
+PG_FUNCTION_INFO_V1(pg_trace_stop);
+Datum
+pg_trace_stop(PG_FUNCTION_ARGS)
 {
-    tracing_enabled = false;
-    ereport(INFO, (errmsg("pg_trace: tracing disabled.")));
-    PG_RETURN_BOOL(false);
-}
-
-Datum pg_trace_status(PG_FUNCTION_ARGS)
-{
-    PG_RETURN_BOOL(tracing_enabled);
+    TimestampTz stop_time;
+    TimestampTz duration;
+    Interval   *result;
+    
+    ensure_tracing_active();
+    
+    stop_time = GetCurrentTimestamp();
+    
+    // Calculate duration safely (TimestampTz is signed)
+    if (stop_time >= trace_start_time) {
+        duration = stop_time - trace_start_time;
+    } else {
+        // Clock went backwards (rare, but possible with NTP adjustments)
+        ereport(WARNING,
+                (errmsg("system clock moved backwards during trace")));
+        duration = 0;  // Or trace_start_time - stop_time for absolute diff
+    }
+    
+    // Allocate result in current memory context
+    result = (Interval *)palloc(sizeof(Interval));
+    
+    // Check allocation succeeded (palloc doesn't return NULL in PG, but good practice)
+    if (result == NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_OUT_OF_MEMORY),
+                 errmsg("out of memory")));
+    
+    // Fill interval structure
+    // Note: PostgreSQL intervals are complex!
+    // time = total microseconds
+    // day = days component
+    // month = months component
+    
+    result->time = duration;   
+    result->day = 0;           
+    result->month = 0;         
+    
+    // Reset state
+    tracing_active = false;
+    trace_start_time = 0;
+    
+    PG_RETURN_INTERVAL_P(result);
 }

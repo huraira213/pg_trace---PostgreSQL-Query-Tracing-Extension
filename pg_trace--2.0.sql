@@ -1,0 +1,9 @@
+CREATE OR REPLACE FUNCTION pg_trace_start()
+RETURNS boolean
+AS 'MODULE_PATHNAME', 'pg_trace_start'
+LANGUAGE C STRICT;
+
+CREATE OR REPLACE FUNCTION pg_trace_stop()
+RETURNS interval
+AS 'MODULE_PATHNAME', 'pg_trace_stop'
+LANGUAGE C STRICT;

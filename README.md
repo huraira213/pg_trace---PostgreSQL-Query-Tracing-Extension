@@ -1,108 +1,78 @@
 # pg_trace - PostgreSQL Query Tracing Extension
 
-A PostgreSQL extension for query performance tracing and analysis.
+Hey! This is pg_trace, a simple PostgreSQL extension I made for tracing queries. It's in early stages, so it's basic right now.
 
-## Overview
+## What is pg_trace?
 
-`pg_trace` is designed to provide detailed insights into query execution times and performance metrics within PostgreSQL. This extension allows developers and database administrators to monitor and analyze query performance in real-time.
+pg_trace helps you time how long things take in PostgreSQL. Start tracing, do stuff, stop and see the duration. Later, it'll hook into queries automatically.
 
-**Current Stage: Stage 1 - Foundation**  
-This is the initial release with basic extension structure and toggle functionality. Future stages will add timing, hooks, and shared memory features.
+**Right now: Stage 2 - Basic timing!**
 
 ## Features
 
-- **Version Information**: Get extension version details
-- **Tracing Control**: Enable/disable tracing functionality
-- **Status Monitoring**: Check current tracing state
-- **Convenience View**: `pg_trace_info` for quick status overview
+- Start tracing to begin timing
+- Stop tracing to get the time elapsed
+- Handles clock issues safely
 
-## Installation
+## How to Install
 
-### Prerequisites
+You need:
+- PostgreSQL 16+
+- gcc and make
+- PostgreSQL dev stuff
 
-- PostgreSQL 16 or later
-- Development tools (gcc, make)
-- PostgreSQL development headers
-
-### Build and Install
-
+Steps:
 ```bash
-# Clone or navigate to the extension directory
 cd pg_trace
-
-# Build the extension
 make
-
-# Install the extension (requires sudo)
 sudo make install
-
-# Create the extension in your database
 sudo -u postgres psql -c "CREATE EXTENSION pg_trace;"
 ```
 
-## Usage
+## How to Use
 
-### Basic Functions
-
+Basic commands:
 ```sql
--- Get extension version
-SELECT pg_trace_version();
+-- Start tracing
+SELECT pg_trace_start();
 
--- Enable tracing
-SELECT pg_trace_enable();
+-- Do some queries here...
 
--- Check tracing status
-SELECT pg_trace_status();
-
--- Disable tracing
-SELECT pg_trace_disable();
-```
-
-### Convenience View
-
-```sql
--- Quick overview of extension status
-SELECT * FROM pg_trace_info;
+-- Stop and get duration
+SELECT pg_trace_stop();
 ```
 
 ## Testing
 
-Run the following commands to verify the installation:
-
+Try this:
 ```bash
-# Test all functions
 sudo -u postgres psql -c "
-  SELECT pg_trace_version();
-  SELECT pg_trace_enable();
-  SELECT pg_trace_status();
-  SELECT pg_trace_disable();
-  SELECT pg_trace_status();
+  SELECT pg_trace_start();
+  -- Wait a bit or run queries
+  SELECT pg_trace_stop();
 "
-
-# Test the view
-sudo -u postgres psql -c "SELECT * FROM pg_trace_info;"
 ```
 
-## Development Roadmap
+## What's Next?
 
-- **Stage 1 (Current)**: Basic extension structure and toggle functionality ✅
-- **Stage 2**: Session-based timing functions
-- **Stage 3**: Introduction to PostgreSQL hooks
-- **Stage 4**: Session memory storage
-- **Stage 5**: Shared memory introduction
-- **Stage 6**: Full production timing with hooks
+- ~~Stage 1: Basic toggle~~ 
+- ~~Stage 2: Add timing for queries~~ 
+- Stage 3: Use PostgreSQL hooks
+- Stage 4: Store data in memory
+- Stage 5: Use shared memory
+- Stage 6: Full tracing ready for production
 
 ## Files
 
-- `pg_trace.c` - Main C source code
-- `pg_trace.control` - Extension metadata
-- `pg_trace--1.0.sql` - SQL function definitions
-- `Makefile` - Build configuration
+- pg_trace.c - The main code
+- pg_trace.control - Extension info
+- pg_trace--2.0.sql - SQL stuff
+- Makefile - For building
 
 ## License
 
-See LICENSE file for details.
+Check LICENSE file.
 
 ## Contributing
 
-This extension is under active development. Contributions and feedback are welcome!
+Feel free to help! This is new, so ideas welcome.
