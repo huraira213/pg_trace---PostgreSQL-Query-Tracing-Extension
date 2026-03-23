@@ -19,3 +19,6 @@ Thumbs.db
 
 # Temporary files
 *~
+
+# Documentation (internal)
+PHASE_*.md

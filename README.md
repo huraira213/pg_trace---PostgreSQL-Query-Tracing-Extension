@@ -1,78 +1,133 @@
 # pg_trace - PostgreSQL Query Tracing Extension
 
-Hey! This is pg_trace, a simple PostgreSQL extension I made for tracing queries. It's in early stages, so it's basic right now.
+A PostgreSQL extension for tracing and analyzing query execution times.
 
-## What is pg_trace?
+## Overview
 
-pg_trace helps you time how long things take in PostgreSQL. Start tracing, do stuff, stop and see the duration. Later, it'll hook into queries automatically.
-
-**Right now: Stage 2 - Basic timing!**
+pg_trace helps you monitor query performance by automatically capturing query text, execution duration, and timestamps. It provides both detailed query traces and aggregated statistics.
 
 ## Features
 
-- Start tracing to begin timing
-- Stop tracing to get the time elapsed
-- Handles clock issues safely
+- Automatic query interception using PostgreSQL executor hooks
+- Per-session query tracing with microsecond precision
+- Aggregated statistics (total, average, min, max duration)
+- SQL views for easy access to trace data
+- Simple start/stop tracing interface
 
-## How to Install
+## Requirements
 
-You need:
-- PostgreSQL 16+
-- gcc and make
-- PostgreSQL dev stuff
+- PostgreSQL 16 or later
+- GCC and Make
+- PostgreSQL development headers
 
-Steps:
+## Installation
+
 ```bash
+git clone <repository-url>
 cd pg_trace
 make
 sudo make install
-sudo -u postgres psql -c "CREATE EXTENSION pg_trace;"
 ```
 
-## How to Use
+## Usage
 
-Basic commands:
+### Enable the Extension
+
+```sql
+CREATE EXTENSION pg_trace;
+```
+
+### Basic Tracing
+
 ```sql
 -- Start tracing
 SELECT pg_trace_start();
 
--- Do some queries here...
+-- Run your queries
+SELECT count(*) FROM pg_tables;
+SELECT generate_series(1, 100);
 
--- Stop and get duration
+-- Stop tracing and get total duration
 SELECT pg_trace_stop();
 ```
 
-## Testing
+### View Traced Queries
 
-Try this:
-```bash
-sudo -u postgres psql -c "
-  SELECT pg_trace_start();
-  -- Wait a bit or run queries
-  SELECT pg_trace_stop();
-"
+```sql
+-- View all traced queries
+SELECT * FROM pg_trace_queries;
 ```
 
-## What's Next?
+**Example output:**
+```
+            query_text             | duration_us |          start_time           |           end_time            
+-----------------------------------+-------------+-------------------------------+-------------------------------
+ 'SELECT count(*) FROM pg_tables;' |         433 | 2026-03-23 22:36:24.125594+05 | 2026-03-23 22:36:24.125594+05
+ 'SELECT generate_series(...);'    |          89 | 2026-03-23 22:36:24.120000+05 | 2026-03-23 22:36:24.120089+05
+```
 
-- ~~Stage 1: Basic toggle~~ 
-- ~~Stage 2: Add timing for queries~~ 
-- Stage 3: Use PostgreSQL hooks
-- Stage 4: Store data in memory
-- Stage 5: Use shared memory
-- Stage 6: Full tracing ready for production
+### View Statistics
 
-## Files
+```sql
+-- Get summary with formatted durations
+SELECT * FROM pg_trace_summary;
+```
 
-- pg_trace.c - The main code
-- pg_trace.control - Extension info
-- pg_trace--2.0.sql - SQL stuff
-- Makefile - For building
+**Example output:**
+```
+ total_queries | total_duration_us | avg_duration_us | max_duration_us | min_duration_us | total_duration_formatted | avg_duration_formatted 
+---------------+-------------------+-----------------+-----------------+-----------------+--------------------------+------------------------
+             3 |               541 |             180 |             433 |              19 | 541 us                   | 180 us
+```
+
+## Function Reference
+
+| Function | Returns | Description |
+|----------|---------|-------------|
+| `pg_trace_start()` | boolean | Start tracing session |
+| `pg_trace_stop()` | interval | Stop tracing, return total duration |
+| `pg_trace_get_queries()` | SETOF record | Get all traced queries |
+| `pg_trace_stats()` | record | Get aggregated statistics |
+| `pg_trace_reset_stats()` | boolean | Reset statistics counters |
+| `pg_trace_clear()` | boolean | Clear all stored traces |
+
+## Views Reference
+
+| View | Description |
+|------|-------------|
+| `pg_trace_queries` | View all traced queries with timing |
+| `pg_trace_summary` | Formatted statistics summary |
+
+## Important Notes
+
+### Session Isolation
+
+Tracing state is per-session. All tracing commands must run in the same database session:
+
+```sql
+-- Correct: all commands in one session
+SELECT pg_trace_start();
+SELECT 1+1;
+SELECT pg_trace_stop();
+SELECT * FROM pg_trace_queries;
+```
+
+### Query Types
+
+Currently only `SELECT` queries are traced.
+
+## Cleanup
+
+```sql
+-- Clear stored queries
+SELECT pg_trace_clear();
+
+-- Reset statistics
+SELECT pg_trace_reset_stats();
+```
 
 ## License
 
-Check LICENSE file.
+See LICENSE file.
 
-## Contributing
 
-Feel free to help! This is new, so ideas welcome.
