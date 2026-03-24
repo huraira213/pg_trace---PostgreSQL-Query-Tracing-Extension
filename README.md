@@ -12,6 +12,7 @@ pg_trace helps you monitor query performance by automatically capturing query te
 - Per-session query tracing with microsecond precision
 - Aggregated statistics (total, average, min, max duration)
 - SQL views for easy access to trace data
+- Configuration via GUC variables
 - Simple start/stop tracing interface
 
 ## Requirements
@@ -23,7 +24,7 @@ pg_trace helps you monitor query performance by automatically capturing query te
 ## Installation
 
 ```bash
-git clone <repository-url>
+git clone git@github.com:huraira213/pg_trace---PostgreSQL-Query-Tracing-Extension.git
 cd pg_trace
 make
 sudo make install
@@ -98,18 +99,39 @@ SELECT * FROM pg_trace_summary;
 | `pg_trace_queries` | View all traced queries with timing |
 | `pg_trace_summary` | Formatted statistics summary |
 
+## Configuration
+
+### GUC Variables
+
+```sql
+-- Enable/disable tracing
+SET pg_trace.enabled = on;  -- default: on
+
+-- Check current setting
+SHOW pg_trace.enabled;
+```
+
 ## Important Notes
 
 ### Session Isolation
 
 Tracing state is per-session. All tracing commands must run in the same database session:
 
+**Correct:**
 ```sql
--- Correct: all commands in one session
+-- All commands in one session
 SELECT pg_trace_start();
 SELECT 1+1;
 SELECT pg_trace_stop();
 SELECT * FROM pg_trace_queries;
+```
+
+**Incorrect:**
+```bash
+# Each psql -c is a separate session - won't work!
+psql -c "SELECT pg_trace_start();"
+psql -c "SELECT 1+1;"
+psql -c "SELECT pg_trace_stop();"
 ```
 
 ### Query Types
@@ -130,4 +152,6 @@ SELECT pg_trace_reset_stats();
 
 See LICENSE file.
 
+## Contributing
 
+Contributions are welcome! Please feel free to submit issues and pull requests.

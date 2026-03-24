@@ -1,5 +1,6 @@
 /*
  * pg_trace - PostgreSQL Query Tracing Extension
+ * Version 4.0 - Enhanced Per-Session Tracing
  *
  * This extension traces query execution times using PostgreSQL hooks.
  */
@@ -12,52 +13,65 @@
 #include "utils/memutils.h"
 #include "funcapi.h"
 #include "commands/extension.h"
-#include "storage/ipc.h"
-#include "storage/lwlock.h"
 #include "miscadmin.h"
+#include "utils/guc.h"
 
 PG_MODULE_MAGIC;
 
+/* ==================== Configuration ==================== */
+
+static bool pg_trace_enabled = true;
+#define PG_TRACE_MAX_ENTRIES 1000
+
+/* ==================== Structures ==================== */
+
+/* Query trace structure */
+typedef struct QueryTrace
+{
+    char       *query_text;
+    TimestampTz start_time;
+    TimestampTz end_time;
+    TimestampTz duration;
+    struct QueryTrace *next;
+} QueryTrace;
+
+/* Statistics structure */
+typedef struct
+{
+    uint64 total_queries;
+    uint64 total_duration;
+    TimestampTz max_duration;
+    TimestampTz min_duration;
+    bool min_set;
+} TraceStats;
+
 /* ==================== Global State ==================== */
 
-/* Session-level tracing state */
+/* Session tracing state */
 static TimestampTz trace_start_time = 0;
 static bool tracing_active = false;
+
+/* Query trace list */
+static QueryTrace *trace_list = NULL;
+static QueryTrace *current_trace = NULL;
+static MemoryContext trace_memctx = NULL;
+
+/* Statistics */
+static TraceStats trace_stats = {0, 0, 0, 0, false};
 
 /* Hook storage */
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 
-/* Query trace structure */
-typedef struct QueryTrace
-{
-    char       *query_text;       /* The query string */
-    TimestampTz start_time;       /* Query start time */
-    TimestampTz end_time;         /* Query end time */
-    TimestampTz duration;         /* Duration in microseconds */
-    struct QueryTrace *next;      /* Next trace in linked list */
-} QueryTrace;
-
-/* Session trace list */
-static QueryTrace *trace_list = NULL;
-static QueryTrace *current_trace = NULL;
-static MemoryContext trace_memctx = NULL;
-
-/* Statistics counters */
-static int64 total_queries_traced = 0;
-static TimestampTz total_duration_all = 0;
-static TimestampTz max_duration = 0;
-static TimestampTz min_duration = -1;  /* -1 means not set yet */
-
 /* ==================== Function Declarations ==================== */
 
-static void pg_trace_init(void);
+void _PG_init(void);
 static void pg_trace_executor_start(QueryDesc *queryDesc, int eflags);
 static void pg_trace_executor_end(QueryDesc *queryDesc);
 static void add_trace_to_list(QueryTrace *trace);
 static void ensure_tracing_active(void);
 static MemoryContext get_trace_memory_context(void);
-static void pg_trace_cleanup(void);
+static void define_custom_variables(void);
 
 /* SQL Functions */
 PG_FUNCTION_INFO_V1(pg_trace_start);
@@ -67,23 +81,20 @@ PG_FUNCTION_INFO_V1(pg_trace_clear);
 PG_FUNCTION_INFO_V1(pg_trace_stats);
 PG_FUNCTION_INFO_V1(pg_trace_reset_stats);
 
-/* ==================== Module Initialization ==================== */
-
-void
-_PG_init(void)
-{
-    pg_trace_init();
-}
+/* ==================== GUC Variables ==================== */
 
 static void
-pg_trace_init(void)
+define_custom_variables(void)
 {
-    /* Install hooks */
-    prev_ExecutorStart = ExecutorStart_hook;
-    ExecutorStart_hook = pg_trace_executor_start;
-
-    prev_ExecutorEnd = ExecutorEnd_hook;
-    ExecutorEnd_hook = pg_trace_executor_end;
+    DefineCustomBoolVariable(
+        "pg_trace.enabled",
+        "Enable or disable pg_trace extension.",
+        NULL,
+        &pg_trace_enabled,
+        true,
+        PGC_USERSET,
+        GUC_NOT_IN_SAMPLE,
+        NULL, NULL, NULL);
 }
 
 /* ==================== Memory Management ==================== */
@@ -91,7 +102,6 @@ pg_trace_init(void)
 static MemoryContext
 get_trace_memory_context(void)
 {
-    /* Create a long-lived memory context for storing traces */
     if (trace_memctx == NULL)
     {
         trace_memctx = AllocSetContextCreate(TopMemoryContext,
@@ -103,68 +113,31 @@ get_trace_memory_context(void)
     return trace_memctx;
 }
 
-/* ==================== Cleanup Callback ==================== */
+/* ==================== Module Initialization ==================== */
 
-/*
- * pg_trace_cleanup - Clean up trace memory on session exit
- * Note: Currently not registered for automatic cleanup, but available for future use.
- *       Traces are stored in TopMemoryContext and will be freed on session end.
- */
-static void
-pg_trace_cleanup(void)
+void
+_PG_init(void)
 {
-    QueryTrace *trace;
+    define_custom_variables();
 
-    /* Free all trace records */
-    while (trace_list)
-    {
-        trace = trace_list;
-        trace_list = trace->next;
+    /* Install hooks */
+    prev_ExecutorStart = ExecutorStart_hook;
+    ExecutorStart_hook = pg_trace_executor_start;
 
-        if (trace->query_text)
-            pfree(trace->query_text);
-        pfree(trace);
-    }
-
-    /* Reset current trace if any */
-    if (current_trace)
-    {
-        if (current_trace->query_text)
-            pfree(current_trace->query_text);
-        pfree(current_trace);
-        current_trace = NULL;
-    }
-
-    /* Reset statistics */
-    total_queries_traced = 0;
-    total_duration_all = 0;
-    max_duration = 0;
-    min_duration = -1;
-
-    /* Delete memory context */
-    if (trace_memctx)
-    {
-        MemoryContextDelete(trace_memctx);
-        trace_memctx = NULL;
-    }
+    prev_ExecutorEnd = ExecutorEnd_hook;
+    ExecutorEnd_hook = pg_trace_executor_end;
 }
-
-/* Suppress unused warning - will be used in future versions for session cleanup */
-__attribute__((unused))
-static void pg_trace_cleanup_wrapper(void) { pg_trace_cleanup(); }
 
 /* ==================== Executor Hooks ==================== */
 
 static void
 pg_trace_executor_start(QueryDesc *queryDesc, int eflags)
 {
-    /* Only trace if tracing is active and we have a valid query string */
-    if (tracing_active && queryDesc->sourceText &&
+    if (pg_trace_enabled && tracing_active && queryDesc->sourceText &&
         queryDesc->operation == CMD_SELECT)
     {
         MemoryContext oldctx;
 
-        /* Allocate trace record in long-lived memory context */
         oldctx = MemoryContextSwitchTo(get_trace_memory_context());
 
         current_trace = (QueryTrace *)palloc0(sizeof(QueryTrace));
@@ -175,7 +148,6 @@ pg_trace_executor_start(QueryDesc *queryDesc, int eflags)
         MemoryContextSwitchTo(oldctx);
     }
 
-    /* Call previous hook */
     if (prev_ExecutorStart)
         prev_ExecutorStart(queryDesc, eflags);
     else
@@ -185,20 +157,17 @@ pg_trace_executor_start(QueryDesc *queryDesc, int eflags)
 static void
 pg_trace_executor_end(QueryDesc *queryDesc)
 {
-    /* Call previous hook first */
     if (prev_ExecutorEnd)
         prev_ExecutorEnd(queryDesc);
     else
         standard_ExecutorEnd(queryDesc);
 
-    /* Record trace if we have an active trace */
-    if (tracing_active && current_trace &&
+    if (pg_trace_enabled && tracing_active && current_trace &&
         current_trace->query_text && queryDesc->sourceText &&
         strcmp(current_trace->query_text, queryDesc->sourceText) == 0)
     {
         current_trace->end_time = GetCurrentTimestamp();
 
-        /* Calculate duration safely */
         if (current_trace->end_time >= current_trace->start_time)
             current_trace->duration = current_trace->end_time - current_trace->start_time;
         else
@@ -209,16 +178,18 @@ pg_trace_executor_end(QueryDesc *queryDesc)
         }
 
         /* Update statistics */
-        total_queries_traced++;
-        total_duration_all += current_trace->duration;
+        trace_stats.total_queries++;
+        trace_stats.total_duration += current_trace->duration;
 
-        if (current_trace->duration > max_duration)
-            max_duration = current_trace->duration;
+        if (current_trace->duration > trace_stats.max_duration)
+            trace_stats.max_duration = current_trace->duration;
 
-        if (min_duration < 0 || current_trace->duration < min_duration)
-            min_duration = current_trace->duration;
+        if (!trace_stats.min_set || current_trace->duration < trace_stats.min_duration)
+        {
+            trace_stats.min_duration = current_trace->duration;
+            trace_stats.min_set = true;
+        }
 
-        /* Add to trace list */
         add_trace_to_list(current_trace);
         current_trace = NULL;
     }
@@ -227,16 +198,12 @@ pg_trace_executor_end(QueryDesc *queryDesc)
 static void
 add_trace_to_list(QueryTrace *trace)
 {
-    /* Add to beginning of list (most recent first) */
     trace->next = trace_list;
     trace_list = trace;
 }
 
 /* ==================== SQL Functions ==================== */
 
-/*
- * pg_trace_start() - Start tracing session
- */
 Datum
 pg_trace_start(PG_FUNCTION_ARGS)
 {
@@ -246,19 +213,22 @@ pg_trace_start(PG_FUNCTION_ARGS)
                  errmsg("tracing already active"),
                  errhint("Call pg_trace_stop() first")));
 
+    if (!pg_trace_enabled)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_trace is disabled"),
+                 errhint("Set pg_trace.enabled = on")));
+
     tracing_active = true;
     trace_start_time = GetCurrentTimestamp();
 
     ereport(NOTICE,
-            (errmsg("Trace started at: " INT64_FORMAT " microseconds since 2000-01-01",
+            (errmsg("Trace started at: " INT64_FORMAT " microseconds",
                     (int64)trace_start_time)));
 
     PG_RETURN_BOOL(true);
 }
 
-/*
- * pg_trace_stop() - Stop tracing and return total duration
- */
 Datum
 pg_trace_stop(PG_FUNCTION_ARGS)
 {
@@ -290,36 +260,22 @@ pg_trace_stop(PG_FUNCTION_ARGS)
     PG_RETURN_INTERVAL_P(result);
 }
 
-/*
- * pg_trace_get_queries() - Return all traced queries
- *
- * Returns a setof record with columns:
- *   query_text text,
- *   duration_us bigint,
- *   start_time timestamptz,
- *   end_time timestamptz
- */
 Datum
 pg_trace_get_queries(PG_FUNCTION_ARGS)
 {
     FuncCallContext  *funcctx;
     MemoryContext     oldcontext;
     QueryTrace       *current;
-    int               call_cntr;
-    int               max_calls;
+    uint32            call_cntr;
+    uint32            max_calls;
     TupleDesc         tupdesc;
     AttInMetadata    *attinmeta;
 
-    /* Stuff done only on the first call */
     if (SRF_IS_FIRSTCALL())
     {
-        /* Create a function context for cross-call persistence */
         funcctx = SRF_FIRSTCALL_INIT();
-
-        /* Switch to memory context appropriate for multiple function calls */
         oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-        /* Count traces */
         max_calls = 0;
         current = trace_list;
         while (current)
@@ -331,7 +287,6 @@ pg_trace_get_queries(PG_FUNCTION_ARGS)
         funcctx->max_calls = max_calls;
         funcctx->call_cntr = 0;
 
-        /* Build a tuple descriptor */
         if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
             ereport(ERROR,
                     (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -344,7 +299,6 @@ pg_trace_get_queries(PG_FUNCTION_ARGS)
         MemoryContextSwitchTo(oldcontext);
     }
 
-    /* Stuff done on every call */
     funcctx = SRF_PERCALL_SETUP();
     call_cntr = funcctx->call_cntr;
     max_calls = funcctx->max_calls;
@@ -352,27 +306,23 @@ pg_trace_get_queries(PG_FUNCTION_ARGS)
 
     if (call_cntr < max_calls)
     {
-        /* Find the current trace record */
-        int i;
         const char *values[4];
         HeapTuple tuple;
         Datum result;
+        uint32 i;
 
         current = trace_list;
         for (i = 0; i < call_cntr; i++)
             current = current->next;
 
-        /* Build values for this row */
         values[0] = quote_literal_cstr(current->query_text);
         values[1] = psprintf(INT64_FORMAT, current->duration);
         values[2] = timestamptz_to_str(current->start_time);
         values[3] = timestamptz_to_str(current->end_time);
 
-        /* Build the tuple */
         tuple = BuildTupleFromCStrings(attinmeta, (char **)values);
         result = HeapTupleGetDatum(tuple);
 
-        /* Free some memory */
         pfree((void *)values[0]);
         pfree((void *)values[1]);
 
@@ -381,20 +331,15 @@ pg_trace_get_queries(PG_FUNCTION_ARGS)
     }
     else
     {
-        /* No more traces to return */
         SRF_RETURN_DONE(funcctx);
     }
 }
 
-/*
- * pg_trace_clear() - Clear all stored traces
- */
 Datum
 pg_trace_clear(PG_FUNCTION_ARGS)
 {
     QueryTrace *trace;
 
-    /* Free all trace records */
     while (trace_list)
     {
         trace = trace_list;
@@ -405,7 +350,6 @@ pg_trace_clear(PG_FUNCTION_ARGS)
         pfree(trace);
     }
 
-    /* Reset current trace if any */
     if (current_trace)
     {
         if (current_trace->query_text)
@@ -417,16 +361,6 @@ pg_trace_clear(PG_FUNCTION_ARGS)
     PG_RETURN_BOOL(true);
 }
 
-/*
- * pg_trace_stats() - Return tracing statistics
- *
- * Returns:
- *   total_queries bigint,
- *   total_duration_us bigint,
- *   avg_duration_us bigint,
- *   max_duration_us bigint,
- *   min_duration_us bigint
- */
 Datum
 pg_trace_stats(PG_FUNCTION_ARGS)
 {
@@ -435,7 +369,6 @@ pg_trace_stats(PG_FUNCTION_ARGS)
     bool        nulls[5] = {false};
     int64       avg_duration = 0;
 
-    /* Build tuple descriptor if needed */
     if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
         ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -444,39 +377,32 @@ pg_trace_stats(PG_FUNCTION_ARGS)
 
     tupdesc = BlessTupleDesc(tupdesc);
 
-    /* Calculate average */
-    if (total_queries_traced > 0)
-        avg_duration = total_duration_all / total_queries_traced;
+    if (trace_stats.total_queries > 0)
+        avg_duration = trace_stats.total_duration / trace_stats.total_queries;
 
-    /* Handle case where no queries traced yet */
-    if (min_duration < 0)
-        min_duration = 0;
+    if (!trace_stats.min_set)
+        trace_stats.min_duration = 0;
 
-    /* Fill values */
-    values[0] = Int64GetDatum(total_queries_traced);
-    values[1] = Int64GetDatum(total_duration_all);
+    values[0] = Int64GetDatum(trace_stats.total_queries);
+    values[1] = Int64GetDatum(trace_stats.total_duration);
     values[2] = Int64GetDatum(avg_duration);
-    values[3] = Int64GetDatum(max_duration);
-    values[4] = Int64GetDatum(min_duration);
+    values[3] = Int64GetDatum(trace_stats.max_duration);
+    values[4] = Int64GetDatum(trace_stats.min_duration);
 
     PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
-/*
- * pg_trace_reset_stats() - Reset statistics counters
- */
 Datum
 pg_trace_reset_stats(PG_FUNCTION_ARGS)
 {
-    total_queries_traced = 0;
-    total_duration_all = 0;
-    max_duration = 0;
-    min_duration = -1;
+    trace_stats.total_queries = 0;
+    trace_stats.total_duration = 0;
+    trace_stats.max_duration = 0;
+    trace_stats.min_duration = 0;
+    trace_stats.min_set = false;
 
     PG_RETURN_BOOL(true);
 }
-
-/* ==================== Cleanup ==================== */
 
 static void
 ensure_tracing_active(void)
