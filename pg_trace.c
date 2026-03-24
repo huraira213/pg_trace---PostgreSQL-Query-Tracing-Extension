@@ -1,8 +1,9 @@
 /*
  * pg_trace - PostgreSQL Query Tracing Extension
- * Version 4.0 - Enhanced Per-Session Tracing
+ * Version 5.0 - Persistent Table-Based Tracing
  *
- * This extension traces query execution times using PostgreSQL hooks.
+ * This extension traces query execution times and stores them in tables
+ * for persistence and analysis.
  */
 
 #include "postgres.h"
@@ -15,13 +16,17 @@
 #include "commands/extension.h"
 #include "miscadmin.h"
 #include "utils/guc.h"
+#include "executor/spi.h"
 
 PG_MODULE_MAGIC;
 
 /* ==================== Configuration ==================== */
 
 static bool pg_trace_enabled = true;
-#define PG_TRACE_MAX_ENTRIES 1000
+static bool pg_trace_auto_trace = false;
+static int pg_trace_log_min_duration_ms = -1;  /* -1 = log all */
+static bool pg_trace_trace_non_select = false;
+static bool pg_trace_use_table_storage = false;  /* Manual flag for table storage */
 
 /* ==================== Structures ==================== */
 
@@ -32,6 +37,8 @@ typedef struct QueryTrace
     TimestampTz start_time;
     TimestampTz end_time;
     TimestampTz duration;
+    Oid userid;
+    Oid dbid;
     struct QueryTrace *next;
 } QueryTrace;
 
@@ -72,6 +79,8 @@ static void add_trace_to_list(QueryTrace *trace);
 static void ensure_tracing_active(void);
 static MemoryContext get_trace_memory_context(void);
 static void define_custom_variables(void);
+static void pg_trace_store_to_table(QueryTrace *trace);
+static bool should_trace_query(QueryDesc *queryDesc, TimestampTz duration);
 
 /* SQL Functions */
 PG_FUNCTION_INFO_V1(pg_trace_start);
@@ -80,6 +89,10 @@ PG_FUNCTION_INFO_V1(pg_trace_get_queries);
 PG_FUNCTION_INFO_V1(pg_trace_clear);
 PG_FUNCTION_INFO_V1(pg_trace_stats);
 PG_FUNCTION_INFO_V1(pg_trace_reset_stats);
+PG_FUNCTION_INFO_V1(pg_trace_enable_auto);
+PG_FUNCTION_INFO_V1(pg_trace_disable_auto);
+PG_FUNCTION_INFO_V1(pg_trace_flush);
+PG_FUNCTION_INFO_V1(pg_trace_cleanup_old);
 
 /* ==================== GUC Variables ==================== */
 
@@ -92,6 +105,38 @@ define_custom_variables(void)
         NULL,
         &pg_trace_enabled,
         true,
+        PGC_USERSET,
+        GUC_NOT_IN_SAMPLE,
+        NULL, NULL, NULL);
+
+    DefineCustomBoolVariable(
+        "pg_trace.auto_trace",
+        "Automatically trace all queries without explicit start/stop.",
+        NULL,
+        &pg_trace_auto_trace,
+        false,
+        PGC_USERSET,
+        GUC_NOT_IN_SAMPLE,
+        NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "pg_trace.log_min_duration_ms",
+        "Log queries taking longer than this many milliseconds. -1 = log all.",
+        NULL,
+        &pg_trace_log_min_duration_ms,
+        -1,
+        -1,
+        INT_MAX,
+        PGC_USERSET,
+        GUC_NOT_IN_SAMPLE,
+        NULL, NULL, NULL);
+
+    DefineCustomBoolVariable(
+        "pg_trace.trace_non_select",
+        "Trace INSERT, UPDATE, DELETE statements in addition to SELECT.",
+        NULL,
+        &pg_trace_trace_non_select,
+        false,
         PGC_USERSET,
         GUC_NOT_IN_SAMPLE,
         NULL, NULL, NULL);
@@ -111,6 +156,71 @@ get_trace_memory_context(void)
                                              ALLOCSET_DEFAULT_MAXSIZE);
     }
     return trace_memctx;
+}
+
+/* ==================== Helper Functions ==================== */
+
+static bool
+should_trace_query(QueryDesc *queryDesc, TimestampTz duration)
+{
+    /* Check if extension is enabled */
+    if (!pg_trace_enabled)
+        return false;
+
+    /* Check minimum duration filter */
+    if (pg_trace_log_min_duration_ms >= 0)
+    {
+        TimestampTz threshold = pg_trace_log_min_duration_ms * 1000;  /* convert to microseconds */
+        if (duration < threshold)
+            return false;
+    }
+
+    /* Check query type */
+    if (!pg_trace_trace_non_select && queryDesc->operation != CMD_SELECT)
+        return false;
+
+    return true;
+}
+
+static void
+pg_trace_store_to_table(QueryTrace *trace)
+{
+    int ret;
+    char *query;
+    char *escaped_query;
+
+    /* Escape single quotes in query text */
+    escaped_query = (char *) palloc(strlen(trace->query_text) * 2 + 1);
+    strcpy(escaped_query, trace->query_text);
+    for (char *p = escaped_query; *p; p++)
+    {
+        if (*p == '\'')
+        {
+            memmove(p + 1, p, strlen(p) + 1);
+            *p++ = '\'';
+        }
+    }
+
+    /* Build INSERT query - convert microseconds to timestamptz */
+    query = psprintf(
+        "INSERT INTO pg_trace_log (query_text, duration_us, start_time, end_time, userid, dbid, application_name) "
+        "VALUES ($spi$%s$spi$, " INT64_FORMAT ", to_timestamp(%f), to_timestamp(%f), %u, %u, current_setting('application_name', true))",
+        escaped_query,
+        trace->duration,
+        trace->start_time / 1000000.0,
+        trace->end_time / 1000000.0,
+        trace->userid,
+        trace->dbid);
+
+    /* Execute via SPI */
+    SPI_connect();
+    ret = SPI_exec(query, 0);
+    if (ret != SPI_OK_INSERT)
+        ereport(WARNING, (errmsg("pg_trace: failed to store trace")));
+    SPI_finish();
+
+    pfree(escaped_query);
+    pfree(query);
 }
 
 /* ==================== Module Initialization ==================== */
@@ -133,8 +243,22 @@ _PG_init(void)
 static void
 pg_trace_executor_start(QueryDesc *queryDesc, int eflags)
 {
-    if (pg_trace_enabled && tracing_active && queryDesc->sourceText &&
-        queryDesc->operation == CMD_SELECT)
+    /* Check if we should trace this query */
+    bool should_trace = false;
+
+    if (pg_trace_enabled && queryDesc->sourceText)
+    {
+        /* Trace if auto-trace is enabled OR manual tracing is active */
+        if (pg_trace_auto_trace || tracing_active)
+        {
+            if (queryDesc->operation == CMD_SELECT || pg_trace_trace_non_select)
+            {
+                should_trace = true;
+            }
+        }
+    }
+
+    if (should_trace)
     {
         MemoryContext oldctx;
 
@@ -143,11 +267,14 @@ pg_trace_executor_start(QueryDesc *queryDesc, int eflags)
         current_trace = (QueryTrace *)palloc0(sizeof(QueryTrace));
         current_trace->query_text = pstrdup(queryDesc->sourceText);
         current_trace->start_time = GetCurrentTimestamp();
+        current_trace->userid = GetUserId();
+        current_trace->dbid = MyDatabaseId;
         current_trace->next = NULL;
 
         MemoryContextSwitchTo(oldctx);
     }
 
+    /* Call previous hook */
     if (prev_ExecutorStart)
         prev_ExecutorStart(queryDesc, eflags);
     else
@@ -157,17 +284,19 @@ pg_trace_executor_start(QueryDesc *queryDesc, int eflags)
 static void
 pg_trace_executor_end(QueryDesc *queryDesc)
 {
+    /* Call previous hook first */
     if (prev_ExecutorEnd)
         prev_ExecutorEnd(queryDesc);
     else
         standard_ExecutorEnd(queryDesc);
 
-    if (pg_trace_enabled && tracing_active && current_trace &&
-        current_trace->query_text && queryDesc->sourceText &&
+    /* Complete trace if we have one */
+    if (current_trace && current_trace->query_text &&
         strcmp(current_trace->query_text, queryDesc->sourceText) == 0)
     {
         current_trace->end_time = GetCurrentTimestamp();
 
+        /* Calculate duration */
         if (current_trace->end_time >= current_trace->start_time)
             current_trace->duration = current_trace->end_time - current_trace->start_time;
         else
@@ -177,21 +306,34 @@ pg_trace_executor_end(QueryDesc *queryDesc)
             current_trace->duration = 0;
         }
 
-        /* Update statistics */
-        trace_stats.total_queries++;
-        trace_stats.total_duration += current_trace->duration;
-
-        if (current_trace->duration > trace_stats.max_duration)
-            trace_stats.max_duration = current_trace->duration;
-
-        if (!trace_stats.min_set || current_trace->duration < trace_stats.min_duration)
+        /* Check if we should store this trace */
+        if (should_trace_query(queryDesc, current_trace->duration))
         {
-            trace_stats.min_duration = current_trace->duration;
-            trace_stats.min_set = true;
-        }
+            /* Update statistics */
+            trace_stats.total_queries++;
+            trace_stats.total_duration += current_trace->duration;
 
-        add_trace_to_list(current_trace);
-        current_trace = NULL;
+            if (current_trace->duration > trace_stats.max_duration)
+                trace_stats.max_duration = current_trace->duration;
+
+            if (!trace_stats.min_set || current_trace->duration < trace_stats.min_duration)
+            {
+                trace_stats.min_duration = current_trace->duration;
+                trace_stats.min_set = true;
+            }
+
+            /* Add to list for later retrieval */
+            add_trace_to_list(current_trace);
+            current_trace = NULL;
+        }
+        else
+        {
+            /* Don't trace this query - free memory */
+            if (current_trace->query_text)
+                pfree(current_trace->query_text);
+            pfree(current_trace);
+            current_trace = NULL;
+        }
     }
 }
 
@@ -402,6 +544,73 @@ pg_trace_reset_stats(PG_FUNCTION_ARGS)
     trace_stats.min_set = false;
 
     PG_RETURN_BOOL(true);
+}
+
+Datum
+pg_trace_enable_auto(PG_FUNCTION_ARGS)
+{
+    pg_trace_auto_trace = true;
+    ereport(NOTICE, (errmsg("pg_trace auto-trace enabled")));
+    PG_RETURN_BOOL(true);
+}
+
+Datum
+pg_trace_disable_auto(PG_FUNCTION_ARGS)
+{
+    pg_trace_auto_trace = false;
+    ereport(NOTICE, (errmsg("pg_trace auto-trace disabled")));
+    PG_RETURN_BOOL(true);
+}
+
+Datum
+pg_trace_flush(PG_FUNCTION_ARGS)
+{
+    /* Flush in-memory traces to table */
+    QueryTrace *trace = trace_list;
+    int flushed = 0;
+
+    while (trace)
+    {
+        QueryTrace *next = trace->next;
+        pg_trace_store_to_table(trace);
+        
+        if (trace->query_text)
+            pfree(trace->query_text);
+        pfree(trace);
+        
+        trace = next;
+        flushed++;
+    }
+
+    trace_list = NULL;
+
+    PG_RETURN_INT32(flushed);
+}
+
+Datum
+pg_trace_cleanup_old(PG_FUNCTION_ARGS)
+{
+    int retention_days = PG_GETARG_INT32(0);
+    int deleted = 0;
+
+    /* Delete old traces from table */
+    if (retention_days > 0)
+    {
+        SPI_connect();
+        
+        char *query = psprintf(
+            "DELETE FROM pg_trace_log WHERE start_time < now() - interval '%d days'",
+            retention_days);
+        
+        int ret = SPI_exec(query, 0);
+        if (ret == SPI_OK_DELETE)
+            deleted = SPI_processed;
+        
+        SPI_finish();
+        pfree(query);
+    }
+
+    PG_RETURN_INT32(deleted);
 }
 
 static void
